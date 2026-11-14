@@ -1,7 +1,15 @@
 import { createServer } from 'node:net';
 import { defineConfig, devices } from '@playwright/test';
 
-const FIXTURES = ['01_minimal', '02_pending'] as const;
+const FIXTURES = [
+  '01_minimal',
+  '02_pending',
+  '03_navigation',
+  '04_base_path',
+] as const;
+const BASE_PATHS: Partial<Record<(typeof FIXTURES)[number], string>> = {
+  '04_base_path': '/app/',
+};
 const production = process.env.E2E_MODE === 'production';
 
 // Bind to port 0 and let the OS pick a free port. Tiny race between close and
@@ -36,14 +44,20 @@ export default defineConfig({
   projects: [
     {
       name: production ? 'chromium-prd' : 'chromium-dev',
-      use: { ...devices['Desktop Chrome'] },
+      use: {
+        ...devices['Desktop Chrome'],
+        // E2E_CHROMIUM points at a preinstalled browser binary.
+        ...(process.env.E2E_CHROMIUM
+          ? { launchOptions: { executablePath: process.env.E2E_CHROMIUM } }
+          : {}),
+      },
     },
   ],
   webServer: FIXTURES.map((fixture) => ({
     command: `cd examples/${fixture} && ${
       production ? 'waku build && waku start' : 'waku dev'
     } -p ${ports[fixture]}`,
-    url: `http://localhost:${ports[fixture]}`,
+    url: `http://localhost:${ports[fixture]}${BASE_PATHS[fixture] ?? ''}`,
     reuseExistingServer: !process.env.CI,
     timeout: 120_000,
   })),
