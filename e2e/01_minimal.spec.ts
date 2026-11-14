@@ -358,7 +358,8 @@ test('an adopted prefetch from a different build reloads the destination documen
     await page.getByTestId('prefetch').click();
     await requestStarted;
     await page.locator('a', { hasText: 'About' }).click();
-    await expect(page).toHaveURL('/about');
+    // The URL commits with the route, so while it loads nothing has moved.
+    await expect(page).toHaveURL('/');
     await expect(page.locator('h1')).toHaveText('Welcome to the Home Page');
     release();
 

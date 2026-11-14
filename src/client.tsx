@@ -648,18 +648,30 @@ function InnerRouter({ fallbackRoute }: { fallbackRoute: Route }) {
         commit();
       };
       signal.addEventListener('abort', settlePending);
+      // A push or replace loads before the URL commits, so a redirect is part
+      // of the same navigation. A traversal or reload names an existing entry,
+      // which cannot be redirected, so it loads afterwards.
+      const precommit =
+        event.cancelable &&
+        (event.navigationType === 'push' ||
+          event.navigationType === 'replace') &&
+        'NavigationPrecommitController' in window;
       // A document load. The listener stays: the user can cancel the unload.
       const leaveDocument = (url: URL) => {
         const left =
           url.href === window.location.href
             ? window.navigation.reload({ info: DOCUMENT_LOAD })
             : window.navigation.navigate(url.href, {
-                history: 'replace',
+                // Before the commit there is no new entry to replace yet.
+                history:
+                  precommit && event.navigationType === 'push'
+                    ? 'push'
+                    : 'replace',
                 info: DOCUMENT_LOAD,
               });
         finishedOf(left).catch(() => {});
       };
-      const load = () =>
+      const load = (controller?: NavigationPrecommitController) =>
         new Promise<void>((resolve, reject) => {
           // Run in a transition: keeps the previous page visible while the
           // next tree suspends, and scopes the optimistic pending updates so
@@ -704,17 +716,20 @@ function InnerRouter({ fallbackRoute }: { fallbackRoute: Route }) {
                   ? getLanded(outcome)
                   : { route: outcome.route, url: outcome.url };
               if (landed.url.href !== destination.href) {
-                // The entry is committed: replace it in a navigation that
-                // adopts this response, which also aborts this one.
-                replaceEntry(landed.url.href, {
-                  scroll: info?.scroll,
-                  follows: outcome.follows,
-                  target: landed.route,
-                  ...(outcome.type === 'loaded'
-                    ? { adopt: Promise.resolve(outcome.elements) }
-                    : {}),
-                });
-                return resolve();
+                if (!controller) {
+                  // The entry is committed: replace it in a navigation that
+                  // adopts this response, which also aborts this one.
+                  replaceEntry(landed.url.href, {
+                    scroll: info?.scroll,
+                    follows: outcome.follows,
+                    target: landed.route,
+                    ...(outcome.type === 'loaded'
+                      ? { adopt: Promise.resolve(outcome.elements) }
+                      : {}),
+                  });
+                  return resolve();
+                }
+                controller.redirect(landed.url.href);
               }
               // Updates after the first await lose the transition scope
               // (https://react.dev/reference/react/startTransition#caveats),
@@ -745,9 +760,11 @@ function InnerRouter({ fallbackRoute }: { fallbackRoute: Route }) {
             }
           });
         });
+      // A failed load still commits the URL before the navigation rejects, so
+      // the error is shown at the address that failed and a reload retries it.
       let failure: { error: unknown } | undefined;
-      const run = () =>
-        load().catch((error: unknown) => {
+      const run = (controller?: NavigationPrecommitController) =>
+        load(controller).catch((error: unknown) => {
           failure = { error };
         });
       const finish = async () => {
@@ -762,7 +779,9 @@ function InnerRouter({ fallbackRoute }: { fallbackRoute: Route }) {
       event.intercept({
         scroll: suppressScroll || reload ? 'manual' : 'after-transition',
         focusReset: reload ? 'manual' : 'after-transition',
-        handler: () => run().then(finish),
+        ...(precommit
+          ? { precommitHandler: run, handler: finish }
+          : { handler: () => run().then(finish) }),
       });
     };
     window.navigation.addEventListener('navigate', callback);
