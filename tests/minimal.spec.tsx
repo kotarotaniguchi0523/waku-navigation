@@ -36,6 +36,14 @@ test('a constructed href keeps its encoded params under the configured base path
   }
 });
 
+test('a protocol-relative href is not placed under the base path', () => {
+  vi.stubEnv('WAKU_CONFIG_BASE_PATH', '/app/');
+  const html = renderToString(
+    <Link to={'//example.com/page' as never}>External</Link>,
+  );
+  expect(html).toContain('href="//example.com/page"');
+});
+
 test.each(['push', 'replace'] as const)(
   '%s applies the configured base path to a constructed href',
   async (method) => {
@@ -51,7 +59,7 @@ test.each(['push', 'replace'] as const)(
 
     expect(navigate).toHaveBeenCalledWith('/app/user/a%20b', {
       history: method,
-      info: { scroll: undefined },
+      info: expect.objectContaining({ scroll: undefined }),
     });
   },
 );

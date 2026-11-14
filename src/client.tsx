@@ -65,12 +65,22 @@ export { Slice, useParams_UNSTABLE, useSearch_UNSTABLE, useSetSearch_UNSTABLE };
 type Route = { path: string; query: string; hash: string };
 type NavigationHref = WakuLinkProps['to'];
 
+const getBase = () =>
+  (import.meta.env?.WAKU_CONFIG_BASE_PATH as string | undefined) || '/';
+
+// A protocol-relative href ('//host/path') names another origin, not a path.
 const addBase = (href: string) => {
-  const base = import.meta.env?.WAKU_CONFIG_BASE_PATH as string | undefined;
-  return base && base !== '/' && href.startsWith('/')
+  const base = getBase();
+  return base !== '/' && href.startsWith('/') && !href.startsWith('//')
     ? base.slice(0, -1) + href
     : href;
 };
+
+// Undefined for another origin or a path outside the base path.
+const toRoute = (url: URL): Route | undefined =>
+  url.origin === window.location.origin && url.pathname.startsWith(getBase())
+    ? parseRoute(url)
+    : undefined;
 
 const NOT_FOUND_PATH = '/404';
 
@@ -88,7 +98,7 @@ type RegisterFn = (id: string, entry: NavStatusEntry) => () => void;
 // the RouterHost.
 const RouterContext = createContext<{
   register: RegisterFn;
-  prefetchRoute: (route: Route) => void;
+  prefetchRoute: (route: Route | undefined) => void;
 }>({
   register: () => () => {},
   prefetchRoute: () => {},
@@ -172,7 +182,7 @@ export function Link({
           if (!entry.isIntersecting) continue;
           const url = new URL(resolvedTo, window.location.href);
           if (url.href !== window.location.href) {
-            prefetchRoute(parseRoute(url));
+            prefetchRoute(toRoute(url));
           }
         }
       },
@@ -186,7 +196,7 @@ export function Link({
       ? (event) => {
           const url = new URL(resolvedTo, window.location.href);
           if (url.href !== window.location.href) {
-            prefetchRoute(parseRoute(url));
+            prefetchRoute(toRoute(url));
           }
           props.onMouseEnter?.(event);
         }
@@ -236,7 +246,7 @@ export function useRouter() {
       window.navigation.forward();
     },
     prefetch: (to: NavigationHref) => {
-      prefetchRoute(parseRoute(new URL(addBase(to), window.location.href)));
+      prefetchRoute(toRoute(new URL(addBase(to), window.location.href)));
     },
   };
 }
@@ -371,9 +381,8 @@ const routeMatchesHref = (href: string, route: Route): boolean => {
   } catch {
     return false;
   }
-  if (url.origin !== window.location.origin) return false;
-  const parsed = parseRoute(url);
-  return parsed.path === route.path && parsed.query === route.query;
+  const parsed = toRoute(url);
+  return parsed?.path === route.path && parsed.query === route.query;
 };
 
 // Routes server function responses: an origin rerender, another route, or a
@@ -442,8 +451,8 @@ function InnerRouter({ fallbackRoute }: { fallbackRoute: Route }) {
     };
   }, []);
   const prefetchRoute = useCallback(
-    (next: Route) => {
-      if (cache.canReuseStaticRoute(next, elementsRef.current)) return;
+    (next: Route | undefined) => {
+      if (!next || cache.canReuseStaticRoute(next, elementsRef.current)) return;
       cache.prefetchRoute(next);
       // When the build publishes it, __WAKU_ROUTER_PREFETCH__ yields the
       // route's JS chunk ids to preload.
@@ -618,7 +627,8 @@ function InnerRouter({ fallbackRoute }: { fallbackRoute: Route }) {
         return;
       }
       const destination = new URL(event.destination.url);
-      const nextRoute = info?.target ?? parseRoute(destination);
+      const nextRoute = info?.target ?? toRoute(destination);
+      if (!nextRoute) return;
       const gen = ++generationRef.current;
       const follows = info?.follows ?? 0;
       const source = (event as NavigateEvent & { sourceElement?: Element })
