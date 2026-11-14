@@ -43,6 +43,7 @@ import {
   unstable_getRouteSlotId as getRouteSlotId,
   unstable_getRouteUrl as getRouteUrl,
   unstable_has404FromElements as has404FromElements,
+  unstable_isSameRoute as isSameRoute,
   unstable_isStaticFromElements as isStaticFromElements,
   unstable_parseRoute as parseRoute,
   useHmrRefetch_UNSTABLE as useHmrRefetch,
@@ -65,12 +66,22 @@ export { Slice, useParams_UNSTABLE, useSearch_UNSTABLE, useSetSearch_UNSTABLE };
 type Route = { path: string; query: string; hash: string };
 type NavigationHref = WakuLinkProps['to'];
 
+const getBase = () =>
+  (import.meta.env?.WAKU_CONFIG_BASE_PATH as string | undefined) || '/';
+
+// A protocol-relative href ('//host/path') names another origin, not a path.
 const addBase = (href: string) => {
-  const base = import.meta.env?.WAKU_CONFIG_BASE_PATH as string | undefined;
-  return base && base !== '/' && href.startsWith('/')
+  const base = getBase();
+  return base !== '/' && href.startsWith('/') && !href.startsWith('//')
     ? base.slice(0, -1) + href
     : href;
 };
+
+// Undefined for another origin or a path outside the base path.
+const toRoute = (url: URL): Route | undefined =>
+  url.origin === window.location.origin && url.pathname.startsWith(getBase())
+    ? parseRoute(url)
+    : undefined;
 
 const NOT_FOUND_PATH = '/404';
 
@@ -88,7 +99,7 @@ type RegisterFn = (id: string, entry: NavStatusEntry) => () => void;
 // the RouterHost.
 const RouterContext = createContext<{
   register: RegisterFn;
-  prefetchRoute: (route: Route) => void;
+  prefetchRoute: (route: Route | undefined) => void;
 }>({
   register: () => () => {},
   prefetchRoute: () => {},
@@ -172,7 +183,7 @@ export function Link({
           if (!entry.isIntersecting) continue;
           const url = new URL(resolvedTo, window.location.href);
           if (url.href !== window.location.href) {
-            prefetchRoute(parseRoute(url));
+            prefetchRoute(toRoute(url));
           }
         }
       },
@@ -186,7 +197,7 @@ export function Link({
       ? (event) => {
           const url = new URL(resolvedTo, window.location.href);
           if (url.href !== window.location.href) {
-            prefetchRoute(parseRoute(url));
+            prefetchRoute(toRoute(url));
           }
           props.onMouseEnter?.(event);
         }
@@ -216,19 +227,11 @@ export function useRouter() {
     path: route.path,
     query: route.query,
     hash: route.hash,
-    push: async (to: NavigationHref, options?: NavigateOptions) => {
-      await window.navigation.navigate(addBase(to), {
-        history: 'push',
-        info: { scroll: options?.scroll },
-      }).finished;
-    },
-    replace: async (to: NavigationHref, options?: NavigateOptions) => {
-      await window.navigation.navigate(addBase(to), {
-        history: 'replace',
-        info: { scroll: options?.scroll },
-      }).finished;
-    },
-    reload: () => window.navigation.reload().finished,
+    push: (to: NavigationHref, options?: NavigateOptions) =>
+      navigate(addBase(to), 'push', { scroll: options?.scroll }),
+    replace: (to: NavigationHref, options?: NavigateOptions) =>
+      navigate(addBase(to), 'replace', { scroll: options?.scroll }),
+    reload: () => navigate(window.location.href, 'reload', {}),
     back: () => {
       window.navigation.back();
     },
@@ -236,28 +239,56 @@ export function useRouter() {
       window.navigation.forward();
     },
     prefetch: (to: NavigationHref) => {
-      prefetchRoute(parseRoute(new URL(addBase(to), window.location.href)));
+      prefetchRoute(toRoute(new URL(addBase(to), window.location.href)));
     },
   };
 }
 
-// The Navigation API rejects `finished` with AbortError for a superseded
-// navigation; the RouterHost contract treats that as settlement.
-const settleFinished = async (finished: Promise<unknown> | undefined) => {
-  try {
-    await finished;
-  } catch (err) {
-    if (!(err instanceof DOMException && err.name === 'AbortError')) throw err;
-  }
+const isAbortError = (error: unknown) =>
+  error instanceof DOMException && error.name === 'AbortError';
+
+// The promise to observe for a navigation's outcome. `committed` rejects with
+// the same error as `finished`, so it is only marked as handled.
+const finishedOf = (result: NavigationResult): Promise<unknown> => {
+  result.committed?.catch(() => {});
+  return result.finished!;
+};
+
+const DOCUMENT_LOAD = 'waku-document-load';
+
+// Resolves once the URL has committed and the response is applied, not on
+// `finished`: that follows the DOM commit, which React holds while an action
+// is pending, so an action awaiting it would wait on itself.
+const navigate = (
+  href: string,
+  history: 'push' | 'replace' | 'reload',
+  info: NavigateInfo,
+): Promise<void> =>
+  new Promise<void>((resolve, reject) => {
+    const applied = () => resolve();
+    const options = { info: { ...info, applied } satisfies NavigateInfo };
+    const result =
+      history === 'reload'
+        ? window.navigation.reload(options)
+        : window.navigation.navigate(href, { history, ...options });
+    finishedOf(result).then(applied, (error: unknown) =>
+      isAbortError(error) ? resolve() : reject(error),
+    );
+  });
+
+// Follows a redirect found after its entry committed, keeping its state.
+const replaceEntry = (href: string, info: NavigateInfo) => {
+  finishedOf(
+    window.navigation.navigate(href, {
+      history: 'replace',
+      state: window.navigation.currentEntry?.getState(),
+      info,
+    }),
+  ).catch(() => {});
 };
 
 const navigateHost: RouterHost['navigate'] = (href, { history, scroll }) =>
-  settleFinished(
-    window.navigation.navigate(href, {
-      history,
-      info: { scroll } satisfies NavigateInfo,
-    }).finished,
-  );
+  navigate(href, history, { scroll });
 
 type Elements = Readonly<Record<string | symbol, unknown>>;
 
@@ -268,55 +299,23 @@ type NavigateInfo = {
   follows?: number;
   // The route to load when it differs from the destination URL (a custom 404).
   target?: Route;
-  // A server function response to apply instead of fetching.
+  // A response to apply instead of fetching.
   adopt?: Promise<Elements>;
-  // Moves the address bar to where a finished navigation landed.
-  urlOnly?: boolean;
+  // Called once the URL has committed and the response is applied.
+  applied?: () => void;
 };
 
+// An in-flight navigation. `commit` lets its intercept handler finish.
+type Pending = { route: Route; commit: () => void };
+
 // The committed navigation. `gen` is the navigation generation its elements
-// came from, `follows` its follow count, `scroll` whether to scroll to its
-// fragment once committed, and `pending` the in-flight marker it settles.
+// came from, `follows` its follow count, and `pending` the in-flight
+// navigation it settles.
 type Committed = {
   route: Route;
   gen: number;
   follows: number;
-  scroll: boolean;
-  pending?: object;
-};
-
-// A run of escapes decodes together, so a multi-byte character survives.
-const decodeHash = (raw: string) =>
-  raw.replace(/(?:%[0-9A-Fa-f]{2})+/g, (escapes) => {
-    try {
-      return decodeURIComponent(escapes);
-    } catch {
-      return escapes;
-    }
-  });
-
-// The element a fragment indicates, as the HTML spec finds it.
-const getFragmentElement = (hash: string): Element | null => {
-  const raw = hash.slice(1);
-  const decoded = decodeHash(raw);
-  for (const name of new Set([raw, decoded])) {
-    const byId = document.getElementById(name);
-    if (byId) return byId;
-    for (const named of document.getElementsByName(name)) {
-      if (named.localName === 'a') return named;
-    }
-  }
-  return decoded.toLowerCase() === 'top' ? document.documentElement : null;
-};
-
-// After a push or replace commits: the fragment target, else the top.
-const scrollToFragment = (hash: string) => {
-  const element = hash ? getFragmentElement(hash) : null;
-  if (element) {
-    element.scrollIntoView({ behavior: 'instant' });
-  } else {
-    window.scrollTo({ left: 0, top: 0, behavior: 'instant' });
-  }
+  pending?: Pending;
 };
 
 type IntentOutcome = { value: string | undefined } | { error: unknown };
@@ -371,9 +370,8 @@ const routeMatchesHref = (href: string, route: Route): boolean => {
   } catch {
     return false;
   }
-  if (url.origin !== window.location.origin) return false;
-  const parsed = parseRoute(url);
-  return parsed.path === route.path && parsed.query === route.query;
+  const parsed = toRoute(url);
+  return parsed?.path === route.path && parsed.query === route.query;
 };
 
 // Routes server function responses: an origin rerender, another route, or a
@@ -395,7 +393,6 @@ function InnerRouter({ fallbackRoute }: { fallbackRoute: Route }) {
     route: initialRoute,
     gen: 0,
     follows: 0,
-    scroll: false,
   };
   const route = committed.route;
   // Rethrow during render so the user's <ErrorBoundary> catches failures;
@@ -419,17 +416,14 @@ function InnerRouter({ fallbackRoute }: { fallbackRoute: Route }) {
   // only while the navigation it arrived with is still the latest one.
   const generationRef = useRef(0);
   // The destination of the in-flight navigation, until it commits or stops.
-  const pendingRef = useRef<{ route: Route }>(undefined);
-  // The intercept handler cannot wait for the commit: React holds a
-  // transition's commit until pending actions finish, and a server function
-  // response navigates from inside one. So the router scrolls once the
-  // destination commits rather than when the handler settles.
+  const pendingRef = useRef<Pending>(undefined);
+  // The destination is in the DOM: let the intercept handler settle.
   useLayoutEffect(() => {
     if (!nav) return;
     if (nav.pending && pendingRef.current === nav.pending) {
       pendingRef.current = undefined;
     }
-    if (nav.scroll) scrollToFragment(nav.route.hash);
+    nav.pending?.commit();
   }, [nav]);
   useEffect(() => {
     cache.learnStaticFromElements(elements);
@@ -442,8 +436,8 @@ function InnerRouter({ fallbackRoute }: { fallbackRoute: Route }) {
     };
   }, []);
   const prefetchRoute = useCallback(
-    (next: Route) => {
-      if (cache.canReuseStaticRoute(next, elementsRef.current)) return;
+    (next: Route | undefined) => {
+      if (!next || cache.canReuseStaticRoute(next, elementsRef.current)) return;
       cache.prefetchRoute(next);
       // When the build publishes it, __WAKU_ROUTER_PREFETCH__ yields the
       // route's JS chunk ids to preload.
@@ -507,16 +501,11 @@ function InnerRouter({ fallbackRoute }: { fallbackRoute: Route }) {
           window.location.replace(decision.url.href);
           return;
         case 'follow':
-          void settleFinished(
-            window.navigation.navigate(decision.url.href, {
-              history: 'replace',
-              info: {
-                scroll: false,
-                follows: scope.follows + 1,
-                target: decision.target,
-              } satisfies NavigateInfo,
-            }).finished,
-          ).catch(() => {});
+          replaceEntry(decision.url.href, {
+            scroll: false,
+            follows: scope.follows + 1,
+            target: decision.target,
+          });
       }
     },
     [],
@@ -582,18 +571,17 @@ function InnerRouter({ fallbackRoute }: { fallbackRoute: Route }) {
       current.path === next.path &&
       (isStaticFromElements(responseElements) || current.query === next.query);
     const target = sameRoute ? current : next;
-    const is404 = next.path === NOT_FOUND_PATH;
-    const url = is404 ? new URL(window.location.href) : getRouteUrl(target);
-    await settleFinished(
-      window.navigation.navigate(url.href, {
-        history: sameRoute || is404 ? 'replace' : 'push',
-        info: {
-          scroll: false,
-          target,
-          adopt: Promise.resolve(responseElements),
-        } satisfies NavigateInfo,
-      }).finished,
-    );
+    // A response for the current entry reloads it, keeping its state. The
+    // entry names another route when a navigation has already moved the URL.
+    const stays =
+      next.path === NOT_FOUND_PATH ||
+      isSameRoute(parseRoute(new URL(window.location.href)), target);
+    const history = stays ? 'reload' : sameRoute ? 'replace' : 'push';
+    await navigate(getRouteUrl(target).href, history, {
+      scroll: false,
+      target,
+      adopt: Promise.resolve(responseElements),
+    });
   }, []);
   useServerFunctionRouting(serverFunctionRouting, {
     getSettledRoute,
@@ -602,23 +590,16 @@ function InnerRouter({ fallbackRoute }: { fallbackRoute: Route }) {
   });
 
   useEffect(() => {
-    const reloadDocument = (url: URL) => {
-      window.navigation.removeEventListener('navigate', callback);
-      window.history.replaceState(window.history.state, '', url);
-      window.location.reload();
-    };
     const callback = (event: NavigateEvent) => {
       if (!event.canIntercept) return;
       if (event.downloadRequest !== null || event.formData) return;
       // React >=19.2's default transition indicator fires fake navigations.
       if (event.info === 'react-transition') return;
+      if (event.info === DOCUMENT_LOAD) return;
       const info = event.info as NavigateInfo | undefined;
-      if (info?.urlOnly) {
-        event.intercept({ scroll: 'manual', focusReset: 'manual' });
-        return;
-      }
       const destination = new URL(event.destination.url);
-      const nextRoute = info?.target ?? parseRoute(destination);
+      const nextRoute = info?.target ?? toRoute(destination);
+      if (!nextRoute) return;
       const gen = ++generationRef.current;
       const follows = info?.follows ?? 0;
       const source = (event as NavigateEvent & { sourceElement?: Element })
@@ -644,7 +625,6 @@ function InnerRouter({ fallbackRoute }: { fallbackRoute: Route }) {
             route: nextRoute,
             gen: prev?.gen ?? 0,
             follows: 0,
-            scroll: false,
           }));
         if (suppressScroll) {
           event.intercept({
@@ -657,17 +637,41 @@ function InnerRouter({ fallbackRoute }: { fallbackRoute: Route }) {
         return;
       }
       const signal = event.signal;
-      const pending = { route: nextRoute };
+      let commit!: () => void;
+      const committed = new Promise<void>((resolve) => {
+        commit = resolve;
+      });
+      const pending: Pending = { route: nextRoute, commit };
       pendingRef.current = pending;
       const settlePending = () => {
         if (pendingRef.current === pending) pendingRef.current = undefined;
+        commit();
       };
       signal.addEventListener('abort', settlePending);
-      // Back/forward and reload keep the browser's scroll restoration.
-      const manualScroll =
-        !suppressScroll &&
-        (event.navigationType === 'push' || event.navigationType === 'replace');
-      const load = () =>
+      // A push or replace loads before the URL commits, so a redirect is part
+      // of the same navigation. A traversal or reload names an existing entry,
+      // which cannot be redirected, so it loads afterwards.
+      const precommit =
+        event.cancelable &&
+        (event.navigationType === 'push' ||
+          event.navigationType === 'replace') &&
+        'NavigationPrecommitController' in window;
+      // A document load. The listener stays: the user can cancel the unload.
+      const leaveDocument = (url: URL) => {
+        const left =
+          url.href === window.location.href
+            ? window.navigation.reload({ info: DOCUMENT_LOAD })
+            : window.navigation.navigate(url.href, {
+                // Before the commit there is no new entry to replace yet.
+                history:
+                  precommit && event.navigationType === 'push'
+                    ? 'push'
+                    : 'replace',
+                info: DOCUMENT_LOAD,
+              });
+        finishedOf(left).catch(() => {});
+      };
+      const load = (controller?: NavigationPrecommitController) =>
         new Promise<void>((resolve, reject) => {
           // Run in a transition: keeps the previous page visible while the
           // next tree suspends, and scopes the optimistic pending updates so
@@ -695,13 +699,13 @@ function InnerRouter({ fallbackRoute }: { fallbackRoute: Route }) {
               }
               if (outcome.type === 'leave') {
                 settlePending();
-                window.location.replace(outcome.location.href);
+                leaveDocument(outcome.location);
                 return resolve();
               }
               if (outcome.type === 'failed') {
                 settlePending();
                 if (isBuildIdMismatch(outcome.error)) {
-                  reloadDocument(outcome.url);
+                  leaveDocument(outcome.url);
                   return resolve();
                 }
                 setRenderError(outcome.error);
@@ -711,6 +715,22 @@ function InnerRouter({ fallbackRoute }: { fallbackRoute: Route }) {
                 outcome.type === 'loaded'
                   ? getLanded(outcome)
                   : { route: outcome.route, url: outcome.url };
+              if (landed.url.href !== destination.href) {
+                if (!controller) {
+                  // The entry is committed: replace it in a navigation that
+                  // adopts this response, which also aborts this one.
+                  replaceEntry(landed.url.href, {
+                    scroll: info?.scroll,
+                    follows: outcome.follows,
+                    target: landed.route,
+                    ...(outcome.type === 'loaded'
+                      ? { adopt: Promise.resolve(outcome.elements) }
+                      : {}),
+                  });
+                  return resolve();
+                }
+                controller.redirect(landed.url.href);
+              }
               // Updates after the first await lose the transition scope
               // (https://react.dev/reference/react/startTransition#caveats),
               // so re-wrap the commit.
@@ -730,31 +750,9 @@ function InnerRouter({ fallbackRoute }: { fallbackRoute: Route }) {
                   route: landed.route,
                   gen,
                   follows: outcome.follows,
-                  scroll: manualScroll,
                   pending,
                 });
               });
-              // A followed redirect lands elsewhere; move the address bar once
-              // this navigation finishes, unless a newer one took over.
-              const transition = window.navigation.transition;
-              if (transition && landed.url.href !== destination.href) {
-                const entry = window.navigation.currentEntry;
-                void transition.finished.then(
-                  () => {
-                    if (
-                      signal.aborted ||
-                      window.navigation.currentEntry !== entry
-                    ) {
-                      return;
-                    }
-                    void window.navigation.navigate(landed.url.href, {
-                      history: 'replace',
-                      info: { urlOnly: true } satisfies NavigateInfo,
-                    });
-                  },
-                  () => {},
-                );
-              }
               resolve();
             } catch (err) {
               settlePending();
@@ -762,17 +760,35 @@ function InnerRouter({ fallbackRoute }: { fallbackRoute: Route }) {
             }
           });
         });
+      // A failed load still commits the URL before the navigation rejects, so
+      // the error is shown at the address that failed and a reload retries it.
+      let failure: { error: unknown } | undefined;
+      const run = (controller?: NavigationPrecommitController) =>
+        load(controller).catch((error: unknown) => {
+          failure = { error };
+        });
+      const finish = async () => {
+        if (failure) throw failure.error;
+        info?.applied?.();
+        await committed;
+      };
+      // The handler settles after the destination commits, so the browser
+      // scrolls, restores and resets focus against the new DOM. A reload keeps
+      // both as they are: the browser would restore a stale saved position.
+      const reload = event.navigationType === 'reload';
       event.intercept({
-        ...(suppressScroll || manualScroll
-          ? { scroll: 'manual' as const }
-          : {}),
-        ...(info?.adopt ? { focusReset: 'manual' as const } : {}),
-        handler: load,
+        scroll: suppressScroll || reload ? 'manual' : 'after-transition',
+        focusReset: reload ? 'manual' : 'after-transition',
+        ...(precommit
+          ? { precommitHandler: run, handler: finish }
+          : { handler: () => run().then(finish) }),
       });
     };
     window.navigation.addEventListener('navigate', callback);
     return () => {
       window.navigation.removeEventListener('navigate', callback);
+      // Nothing will commit the in-flight navigation any more.
+      pendingRef.current?.commit();
     };
   }, [cache, mergeElements]);
   // The same RouterHost waku's INTERNAL_ServerRouter provides during SSR, which
